@@ -28,7 +28,7 @@ Documentation = "https://github.com/comrender/ComfyUI-Topaz-Upscaler/wiki"
 "Bug Tracker" = "https://github.com/comrender/ComfyUI-Topaz-Upscaler/issues"
 
 [tool.comfy]
-PublisherId = ""
+PublisherId = "comrender"
 DisplayName = "ComfyUI-Topaz-Upscaler"
 Icon = ""
 includes = [] 
