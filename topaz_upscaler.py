@@ -93,26 +93,67 @@ class TopazUpscaler:
                                    headers=headers, files=files, data=params)
         response.raise_for_status()
         data = response.json()
-        return data["process_id"], data.get("eta", 0)
+        
+        # Log full response for debugging
+        print(f"[Topaz] Submit response: {data}")
+        
+        # Try both possible keys (API inconsistency)
+        process_id = data.get("process_id") or data.get("task_id")
+        if not process_id:
+            raise ValueError(f"No process_id or task_id in response: {data}")
+        
+        eta = data.get("eta", 0)
+        print(f"[Topaz] Extracted ID: {process_id} | ETA: {eta}")
+        
+        return process_id, eta
 
-    def _wait_for_completion(self, process_id, api_key, timeout):
+    def _wait_for_completion(self, job_id, api_key, timeout):
         headers = {"X-API-Key": api_key}
         start = time.time()
+        retries = 0
+        max_retries = 3
+        
         while time.time() - start < timeout:
-            resp = requests.get(f"{BASE_URL}/getStatus?process_id={process_id}", headers=headers)
-            resp.raise_for_status()
-            status = resp.json()
-            if status["status"] == "completed":
-                return True
-            if status["status"] == "failed":
-                raise Exception(f"Topaz task failed: {status.get('error', 'Unknown')}")
+            try:
+                # FIXED: Use task_id= (not process_id=)
+                resp = requests.get(f"{BASE_URL}/getStatus?task_id={job_id}", headers=headers)
+                if resp.status_code == 404:
+                    # Fallback: Try process_id= param
+                    resp = requests.get(f"{BASE_URL}/getStatus?process_id={job_id}", headers=headers)
+                
+                resp.raise_for_status()
+                status = resp.json()
+                
+                print(f"[Topaz] Status: {status.get('status', 'unknown')}")
+                
+                if status["status"] == "completed":
+                    return True
+                if status["status"] == "failed":
+                    raise Exception(f"Topaz task failed: {status.get('error', 'Unknown')}")
+                
+                retries = 0  # Reset on success
+                
+            except requests.exceptions.RequestException as e:
+                retries += 1
+                if retries > max_retries:
+                    raise Exception(f"Status check failed after {max_retries} retries: {e}")
+                print(f"[Topaz] Status retry {retries}/{max_retries}: {e}")
+                time.sleep(2)  # Short backoff
+            
             time.sleep(5)
-        raise TimeoutError(f"Task {process_id} timed out after {timeout}s")
+        
+        raise TimeoutError(f"Task {job_id} timed out after {timeout}s")
 
-    def _download_result(self, process_id, api_key, output_format):
+    def _download_result(self, job_id, api_key, output_format):
         accept = FORMAT_ACCEPT.get(output_format, "image/jpeg")
         headers = {"X-API-Key": api_key, "accept": accept}
-        resp = requests.get(f"{BASE_URL}/getDownloadOutput?process_id={process_id}", headers=headers)
+        
+        # FIXED: Use task_id= (not process_id=)
+        resp = requests.get(f"{BASE_URL}/getDownloadOutput?task_id={job_id}", headers=headers)
+        if resp.status_code == 404:
+            # Fallback: Try process_id=
+            resp = requests.get(f"{BASE_URL}/getDownloadOutput?process_id={job_id}", headers=headers)
+        
         resp.raise_for_status()
         return resp.content
 
@@ -171,15 +212,17 @@ class TopazUpscaler:
 
         try:
             print(f"[Topaz] Submitting {mode} job | Model: {model} | Size: {output_width}×{output_height}")
-            process_id, eta = self._submit_job(input_path, api_key, mode, params)
-            print(f"[Topaz] Process ID: {process_id} | ETA: {eta}")
+            job_id, eta = self._submit_job(input_path, api_key, mode, params)
 
-            self._wait_for_completion(process_id, api_key, timeout_seconds)
-            result_bytes = self._download_result(process_id, api_key, output_format)
+            print(f"[Topaz] Waiting for completion...")
+            self._wait_for_completion(job_id, api_key, timeout_seconds)
+
+            print(f"[Topaz] Downloading result...")
+            result_bytes = self._download_result(job_id, api_key, output_format)
 
             result_pil = Image.open(io.BytesIO(result_bytes))
             result_np = np.array(result_pil).astype(np.float32) / 255.0
-            if result_np.shape[2] == 4:
+            if len(result_np.shape) == 3 and result_np.shape[2] == 4:
                 result_np = result_np[:, :, :3]  # Drop alpha
             result_tensor = result_np[np.newaxis, ...]
 
