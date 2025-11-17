@@ -11,7 +11,7 @@ BASE_URL = "https://api.topazlabs.com/image/v1"
 # Modes
 TOPAZ_MODES = ["enhance", "sharpen", "denoise", "restore", "lighting"]
 
-# Models (from docs: standard fast, generative slow/creative)
+# Models (full list)
 TOPAZ_MODELS_STANDARD = [
     "Standard V2", "Low Resolution V2", "CGI", "High Fidelity V2", "Text Refine",
     "Standard", "Strong", "Lens Blur", "Lens Blur V2", "Motion Blur", "Natural", "Refocus",
@@ -80,14 +80,13 @@ class TopazUpscaler:
         headers = {"X-API-Key": api_key, "Accept": "application/json"}
         with open(image_path, 'rb') as f:
             files = {'image': (os.path.basename(image_path), f, 'image/jpeg')}
-            # FIXED: All params as STRINGS (per docs/example)
+            # All params as STRINGS
             data = {k: str(v) for k, v in params.items()}
             response = requests.post(f"{BASE_URL}{path}", headers=headers, files=files, data=data)
         response.raise_for_status()
         data = response.json()
         print(f"[Topaz] Submit response: {data}")
         
-        # Extract process_id (modern API)
         process_id = data.get("process_id") or response.headers.get("X-Process-ID")
         if not process_id:
             raise ValueError(f"No process_id in response: {data}")
@@ -102,7 +101,7 @@ class TopazUpscaler:
     def _wait_for_completion(self, process_id, api_key, timeout):
         headers = {"X-API-Key": api_key}
         start = time.time()
-        poll_interval = 10  # Slower for async
+        poll_interval = 10
         
         status_url = f"{BASE_URL}/status/{process_id}"
         print(f"[Topaz] Status URL: {status_url}")
@@ -112,17 +111,21 @@ class TopazUpscaler:
             print(f"[Topaz] Status code: {resp.status_code}")
             
             if resp.status_code == 404:
-                print("[Topaz] 404 - job pending or not ready. Retrying...")
+                print("[Topaz] 404 - job pending. Retrying...")
                 time.sleep(poll_interval)
                 continue
             
             resp.raise_for_status()
             status = resp.json()
-            print(f"[Topaz] Status: {status.get('status')} | Progress: {status.get('progress', 'N/A')}%")
+            status_val = status.get("status", "").strip()  # Get raw status
+            progress = status.get('progress', 'N/A')
+            print(f"[Topaz] Status: {status_val} | Progress: {progress}%")
             
-            if status.get("status") == "completed":
+            # FIXED: Case-insensitive check + lowercase for comparison
+            if status_val.lower() == "completed":
+                print("[Topaz] Job completed! Proceeding to download.")
                 return True
-            if status.get("status") == "failed":
+            if status_val.lower() == "failed":
                 raise Exception(f"Job failed: {status.get('error', 'Unknown')}")
             
             time.sleep(poll_interval)
@@ -166,7 +169,7 @@ class TopazUpscaler:
             output_width, output_height = new_w, new_h
             print(f"[Topaz] Auto-scale ×{scale_multiplier}: {w}×{h} → {new_w}×{new_h}")
 
-        # Params (all will be str in submit)
+        # Params
         params = {
             "model": model,
             "output_format": output_format,
@@ -196,9 +199,9 @@ class TopazUpscaler:
             print(f"[Topaz] Submitting {mode} | Model: {model} | Size: {output_width}×{output_height}")
             process_id, eta_remaining = self._submit_job(input_path, api_key, mode, model, params)
             
-            # Auto-extend timeout if ETA > current
+            # Auto-extend if ETA > timeout
             if eta_remaining > timeout_seconds:
-                timeout_seconds = eta_remaining + 60  # Buffer
+                timeout_seconds = eta_remaining + 60
                 print(f"[Topaz] Extended timeout to {timeout_seconds}s based on ETA")
 
             print(f"[Topaz] Waiting...")
