@@ -5,6 +5,7 @@ import tempfile
 import numpy as np
 from PIL import Image
 import io
+import torch
 
 BASE_URL = "https://api.topazlabs.com/image/v1"
 
@@ -263,7 +264,7 @@ class TopazUpscaler:
             result_np = np.array(result_pil).astype(np.float32) / 255.0
             if result_np.ndim == 3 and result_np.shape[2] == 4:
                 result_np = result_np[:, :, :3]
-            result_tensor = np.expand_dims(result_np, axis=0)
+            result_tensor = torch.from_numpy(result_np).unsqueeze(0)
 
             print(f"[Topaz] Success! Output: {result_tensor.shape} | {result_pil.format}")
             return (result_tensor,)
@@ -276,3 +277,4 @@ class TopazUpscaler:
 NODE_CLASS_MAPPINGS = {"TopazUpscaler": TopazUpscaler}
 NODE_DISPLAY_NAME_MAPPINGS = {"TopazUpscaler": "Topaz Upscaler"}
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
+
