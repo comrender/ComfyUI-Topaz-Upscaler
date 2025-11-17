@@ -5,14 +5,14 @@ import tempfile
 import numpy as np
 from PIL import Image
 import io
-import torch
+import torch  # ← Critical for correct tensor return
 
 BASE_URL = "https://api.topazlabs.com/image/v1"
 
-# Modes (unchanged)
+# Modes
 TOPAZ_MODES = ["enhance", "sharpen", "denoise", "restore", "lighting"]
 
-# Updated models grouped by mode and type (from current docs)
+# Updated & accurate model lists (November 2025)
 ENHANCE_GAN_MODELS = ["Standard V2", "Low Resolution V2", "CGI", "High Fidelity V2", "Text Refine"]
 ENHANCE_GEN_MODELS = ["Redefine", "Recovery V2", "Standard MAX", "Wonder"]
 SHARPEN_GAN_MODELS = ["Standard", "Strong", "Lens Blur", "Lens Blur V2", "Motion Blur", "Natural", "Refocus"]
@@ -21,22 +21,13 @@ DENOISE_GAN_MODELS = ["Normal", "Strong", "Extreme"]
 RESTORE_GEN_MODELS = ["Dust-Scratch"]
 LIGHTING_GAN_MODELS = ["Adjust", "White Balance"]
 
-# All unique models for the dropdown
 TOPAZ_MODELS = list(set(
     ENHANCE_GAN_MODELS + ENHANCE_GEN_MODELS +
     SHARPEN_GAN_MODELS + SHARPEN_GEN_MODELS +
-    DENOISE_GAN_MODELS +
-    RESTORE_GEN_MODELS +
-    LIGHTING_GAN_MODELS
+    DENOISE_GAN_MODELS + RESTORE_GEN_MODELS + LIGHTING_GAN_MODELS
 ))
 
-FORMAT_ACCEPT = {
-    "jpeg": "image/jpeg",
-    "png": "image/png",
-    "tiff": "image/tiff"
-}
-
-# Magic bytes for format validation
+FORMAT_ACCEPT = {"jpeg": "image/jpeg", "png": "image/png", "tiff": "image/tiff"}
 FORMAT_MAGIC = {
     "jpeg": b'\xff\xd8\xff',
     "png": b'\x89PNG\r\n\x1a\n',
@@ -56,13 +47,34 @@ class TopazUpscaler:
                 }),
                 "mode": (TOPAZ_MODES, {"default": "enhance"}),
                 "model": (TOPAZ_MODELS, {"default": "Standard V2"}),
+                "scale_multiplier": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 1.0,
+                    "max": 4.0,
+                    "step": 0.1,
+                    "display": "slider",
+                    "tooltip": "Set >1.0 to auto-upscale. Set exactly 1.0 to use manual width/height."
+                }),
             },
             "optional": {
-                "scale_multiplier": ("FLOAT", {
-                    "default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1
+                "output_width": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 32000,
+                    "step": 64,
+                    "display": "number",
+                    "visible": {"condition": {"scale_multiplier": ["1.0"]}, "value": True},
+                    "tooltip": "Only used when scale_multiplier = 1.0"
                 }),
-                "output_width": ("INT", {"default": 0, "min": 1, "max": 32000, "step": 64}),
-                "output_height": ("INT", {"default": 0, "min": 1, "max": 32000, "step": 64}),
+                "output_height": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 32000,
+                    "step": 64,
+                    "display": "number",
+                    "visible": {"condition": {"scale_multiplier": ["1.0"]}, "value": True},
+                    "tooltip": "Only used when scale_multiplier = 1.0"
+                }),
                 "crop_to_fill": ("BOOLEAN", {"default": False}),
                 "output_format": (["jpeg", "png", "tiff"], {"default": "jpeg"}),
                 "face_enhancement": ("BOOLEAN", {"default": True}),
@@ -81,35 +93,18 @@ class TopazUpscaler:
 
     def _get_submit_path(self, mode, model):
         if mode == "enhance":
-            if model in ENHANCE_GEN_MODELS:
-                return "/enhance-gen/async"
-            elif model in ENHANCE_GAN_MODELS:
-                return "/enhance/async"
-            else:
-                raise ValueError(f"Invalid model '{model}' for mode 'enhance'")
+            if model in ENHANCE_GEN_MODELS: return "/enhance-gen/async"
+            if model in ENHANCE_GAN_MODELS: return "/enhance/async"
         elif mode == "sharpen":
-            if model in SHARPEN_GEN_MODELS:
-                return "/sharpen-gen/async"
-            elif model in SHARPEN_GAN_MODELS:
-                return "/sharpen/async"
-            else:
-                raise ValueError(f"Invalid model '{model}' for mode 'sharpen'")
+            if model in SHARPEN_GEN_MODELS: return "/sharpen-gen/async"
+            if model in SHARPEN_GAN_MODELS: return "/sharpen/async"
         elif mode == "denoise":
-            if model in DENOISE_GAN_MODELS:
-                return "/denoise/async"
-            else:
-                raise ValueError(f"Invalid model '{model}' for mode 'denoise'")
+            if model in DENOISE_GAN_MODELS: return "/denoise/async"
         elif mode == "restore":
-            if model in RESTORE_GEN_MODELS:
-                return "/restore-gen/async"
-            else:
-                raise ValueError(f"Invalid model '{model}' for mode 'restore'")
+            if model in RESTORE_GEN_MODELS: return "/restore-gen/async"
         elif mode == "lighting":
-            if model in LIGHTING_GAN_MODELS:
-                return "/lighting/async"
-            else:
-                raise ValueError(f"Invalid model '{model}' for mode 'lighting'")
-        raise ValueError(f"Invalid mode '{mode}'")
+            if model in LIGHTING_GAN_MODELS: return "/lighting/async"
+        raise ValueError(f"Invalid combination: mode='{mode}', model='{model}'")
 
     def _submit_job(self, image_path, api_key, mode, model, params):
         path = self._get_submit_path(mode, model)
@@ -125,11 +120,7 @@ class TopazUpscaler:
         process_id = resp_json.get("process_id") or response.headers.get("X-Process-ID")
         if not process_id:
             raise ValueError("No process_id returned")
-
-        eta = int(response.headers.get("X-ETA", 0)) if response.headers.get("X-ETA") else 0
-        eta_remaining = max(eta - int(time.time()), 0)
-        print(f"[Topaz] Process ID: {process_id} | ETA: ~{eta_remaining}s")
-        return process_id, eta_remaining
+        return process_id, 0
 
     def _wait_for_completion(self, process_id, api_key, timeout):
         headers = {"X-API-Key": api_key}
@@ -141,25 +132,21 @@ class TopazUpscaler:
             try:
                 resp = requests.get(url, headers=headers, timeout=30)
                 if resp.status_code == 404:
-                    time.sleep(5)
-                    continue
+                    time.sleep(5); continue
                 resp.raise_for_status()
                 status = resp.json()
-                st = status.get("status", "").strip()
+                st = status.get("status", "").strip().lower()
                 prog = status.get("progress", "N/A")
-                print(f"[Topaz] Status: {st} | Progress: {prog}%")
+                print(f"[Topaz] Status: {st.capitalize()} | Progress: {prog}%")
 
-                if st.lower() == "completed":
+                if st == "completed":
                     print("[Topaz] Job completed!")
                     return True
-                if st.lower() == "failed":
-                    raise Exception(f"Job failed: {status.get('error')}")
-
+                if st == "failed":
+                    raise Exception(f"Job failed: {status.get('error', 'Unknown error')}")
             except Exception as e:
                 print(f"[Topaz] Status check error: {e}")
-
             time.sleep(8)
-
         raise TimeoutError(f"Timed out after {timeout}s")
 
     def _download_result(self, process_id, api_key, output_format):
@@ -167,42 +154,39 @@ class TopazUpscaler:
         url = f"{BASE_URL}/download/{process_id}"
         print(f"[Topaz] Download URL: {url}")
 
-        for attempt in range(6):
+        for attempt in range(8):
             resp = requests.get(url, headers=headers, timeout=30)
             print(f"[Topaz] Download attempt {attempt+1} → {resp.status_code}")
 
             if resp.status_code == 409:
-                print(f"[Topaz] Not ready → retry in 3s...")
-                time.sleep(3)
-                continue
+                time.sleep(3); continue
 
             resp.raise_for_status()
             data = resp.json()
-            download_url = data.get("download_url")
-            if not download_url:
-                raise ValueError("No download_url in response")
+            dl_url = data.get("download_url")
+            if not dl_url:
+                raise ValueError("No download_url received")
 
-            img_resp = requests.get(download_url, timeout=30)
+            img_resp = requests.get(dl_url, timeout=60)
             img_resp.raise_for_status()
             content = img_resp.content
 
-            # Validate based on format
-            valid = False
+            # Validate format
             if output_format == "jpeg" and content.startswith(FORMAT_MAGIC["jpeg"]):
-                valid = True
+                pass
             elif output_format == "png" and content.startswith(FORMAT_MAGIC["png"]):
-                valid = True
+                pass
             elif output_format == "tiff" and content[:4] in FORMAT_MAGIC["tiff"]:
-                valid = True
+                pass
+            else:
+                print(f"[Topaz] Invalid image content → retrying...")
+                time.sleep(3)
+                continue
 
-            if valid:
-                print(f"[Topaz] Valid image received ({len(content)/1024:.1f} KB)")
-                return content
+            print(f"[Topaz] Valid image received ({len(content)/1024:.1f} KB)")
+            return content
 
-            print(f"[Topaz] Invalid image content → retry in 3s...")
-            time.sleep(3)
-
-        raise Exception("Failed to download valid image")
+        raise Exception("Failed to download valid image after retries")
 
     def process(self, image, api_key, mode, model,
                 scale_multiplier=1.0, output_width=0, output_height=0, crop_to_fill=False,
@@ -213,13 +197,19 @@ class TopazUpscaler:
         if not api_key.strip():
             raise ValueError("Topaz API key required")
 
-        # Auto-scale if enhance mode and multiplier !=1
         h, w = image.shape[1], image.shape[2]
-        if mode == "enhance" and scale_multiplier != 1.0:
-            new_w = max(1, min(32000, int(w * scale_multiplier)))
-            new_h = max(1, min(32000, int(h * scale_multiplier)))
+
+        # Auto-scale logic
+        if scale_multiplier > 1.0:
+            if output_width > 0 or output_height > 0:
+                print(f"[Topaz] Ignoring manual width/height → using scale_multiplier ×{scale_multiplier}")
+            new_w = max(64, min(32000, int(w * scale_multiplier)))
+            new_h = max(64, min(32000, int(h * scale_multiplier)))
             output_width, output_height = new_w, new_h
             print(f"[Topaz] Auto-scale ×{scale_multiplier}: {w}×{h} → {new_w}×{new_h}")
+        else:
+            if mode == "enhance" and output_width == 0 and output_height == 0:
+                print("[Topaz] No output size specified → using original dimensions")
 
         params = {
             "model": model,
@@ -235,14 +225,13 @@ class TopazUpscaler:
             if output_height: params["output_height"] = output_height
             params["crop_to_fill"] = str(crop_to_fill).lower()
 
+        # Save input image
         img_np = (image[0].cpu().numpy() * 255).astype(np.uint8)
         pil_img = Image.fromarray(img_np)
         suffix = ".jpg" if output_format == "jpeg" else f".{output_format}"
-        save_args = {}
-        if output_format == "jpeg":
-            save_args["quality"] = 95
-        elif output_format == "png":
-            save_args["compress_level"] = 4  # Balanced
+        save_args = {"quality": 95} if output_format == "jpeg" else {}
+        if output_format == "png":
+            save_args["compress_level"] = 4
         elif output_format == "tiff":
             save_args["compression"] = "tiff_deflate"
 
@@ -264,6 +253,8 @@ class TopazUpscaler:
             result_np = np.array(result_pil).astype(np.float32) / 255.0
             if result_np.ndim == 3 and result_np.shape[2] == 4:
                 result_np = result_np[:, :, :3]
+
+            # Critical: return PyTorch tensor, not numpy
             result_tensor = torch.from_numpy(result_np).unsqueeze(0)
 
             print(f"[Topaz] Success! Output: {result_tensor.shape} | {result_pil.format}")
@@ -275,6 +266,5 @@ class TopazUpscaler:
 
 
 NODE_CLASS_MAPPINGS = {"TopazUpscaler": TopazUpscaler}
-NODE_DISPLAY_NAME_MAPPINGS = {"TopazUpscaler": "Topaz Upscaler"}
+NODE_DISPLAY_NAME_MAPPINGS = {"TopazUpscaler": "Topaz Upscaler (API)"}
 __all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS']
-
