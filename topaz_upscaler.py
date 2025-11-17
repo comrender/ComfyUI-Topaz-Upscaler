@@ -5,9 +5,25 @@ import tempfile
 import numpy as np
 from PIL import Image
 import io
-import math
 
 BASE_URL = "https://api.topazlabs.com/image/v1"
+
+# Modes
+TOPAZ_MODES = ["enhance", "sharpen", "denoise", "restore", "lighting"]
+
+# Models (from docs: standard fast, generative slow/creative)
+TOPAZ_MODELS_STANDARD = [
+    "Standard V2", "Low Resolution V2", "CGI", "High Fidelity V2", "Text Refine",
+    "Standard", "Strong", "Lens Blur", "Lens Blur V2", "Motion Blur", "Natural", "Refocus",
+    "Normal", "Extreme", "Dust-Scratch", "Adjust", "White Balance"
+]
+TOPAZ_MODELS_GENERATIVE = [
+    "Redefine", "Recovery V2", "Standard MAX", "Wonder", "Super Focus V2"
+]
+TOPAZ_MODELS = TOPAZ_MODELS_STANDARD + TOPAZ_MODELS_GENERATIVE
+
+# Accept headers
+FORMAT_ACCEPT = {"jpeg": "image/jpeg", "png": "image/png", "tiff": "image/tiff"}
 
 class TopazUpscaler:
     @classmethod
@@ -20,89 +36,89 @@ class TopazUpscaler:
                     "default": "",
                     "placeholder": "Enter your Topaz API key"
                 }),
-                "output_width": ("INT", {
-                    "default": 3840,
-                    "min": 512,
-                    "max": 16000,
-                    "step": 64
-                }),
+                "mode": (TOPAZ_MODES, {"default": "enhance"}),
+                "model": (TOPAZ_MODELS, {"default": "Standard V2"}),
             },
             "optional": {
                 "scale_multiplier": ("FLOAT", {
-                    "default": 1.0,
-                    "min": 0.1,
-                    "max": 10.0,
-                    "step": 0.1
+                    "default": 1.0, "min": 0.1, "max": 10.0, "step": 0.1
+                }),
+                "output_width": ("INT", {
+                    "default": 0, "min": 1, "max": 32000, "step": 64
+                }),
+                "output_height": ("INT", {
+                    "default": 0, "min": 1, "max": 32000, "step": 64
                 }),
                 "crop_to_fill": ("BOOLEAN", {"default": False}),
-                "timeout_seconds": ("INT", {
-                    "default": 180,  # Matches original
-                    "min": 30,
-                    "max": 1800,
-                    "step": 30
-                }),
+                "output_format": (["jpeg", "png", "tiff"], {"default": "jpeg"}),
+                "face_enhancement": ("BOOLEAN", {"default": True}),
+                "denoise_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "sharpen_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "fix_compression": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "timeout_seconds": ("INT", {"default": 300, "min": 60, "max": 1800, "step": 60}),
             }
         }
 
     RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("upscaled_image",)
-    FUNCTION = "upscale"
-    CATEGORY = "image/upscaling"
+    RETURN_NAMES = ("processed_image",)
+    FUNCTION = "process"
+    CATEGORY = "image/topaz"
 
-    def _submit_job(self, image_path, api_key, output_width, crop_to_fill):
-        headers = {
-            "X-API-Key": api_key,
-            "accept": "application/json"
+    def _get_submit_path(self, mode, model):
+        paths = {
+            "enhance": "/enhance/async" if model in TOPAZ_MODELS_GENERATIVE else "/enhance/async",
+            "sharpen": "/sharpen/async",
+            "denoise": "/denoise/async",
+            "restore": "/restore-gen/async",
+            "lighting": "/lighting/async"
         }
+        return paths.get(mode, "/enhance/async")
+
+    def _submit_job(self, image_path, api_key, mode, model, params):
+        path = self._get_submit_path(mode, model)
+        headers = {"X-API-Key": api_key, "Accept": "application/json"}
         with open(image_path, 'rb') as f:
-            files = {'image': f}
-            data = {
-                "output_width": output_width,
-                "crop_to_fill": str(crop_to_fill).lower(),
-                "output_format": "jpeg"
-            }
-            response = requests.post(f"{BASE_URL}/enhanceAsync", headers=headers, files=files, data=data)
+            files = {'image': (os.path.basename(image_path), f, 'image/jpeg')}
+            # FIXED: All params as STRINGS (per docs/example)
+            data = {k: str(v) for k, v in params.items()}
+            response = requests.post(f"{BASE_URL}{path}", headers=headers, files=files, data=data)
         response.raise_for_status()
         data = response.json()
         print(f"[Topaz] Submit response: {data}")
         
-        # Extract task_id (original format)
-        task_id = data.get("task_id")
-        if not task_id:
-            # Fallback to process_id or header if API changed
-            task_id = data.get("process_id") or response.headers.get("X-Process-ID")
-            if not task_id:
-                raise ValueError(f"No task_id/process_id in response: {data}")
+        # Extract process_id (modern API)
+        process_id = data.get("process_id") or response.headers.get("X-Process-ID")
+        if not process_id:
+            raise ValueError(f"No process_id in response: {data}")
         
-        # Check for ETA header (Unix timestamp)
-        eta_header = response.headers.get("X-ETA")
-        eta = int(eta_header) if eta_header else None
-        if eta:
-            remaining = max(eta - int(time.time()), 0)
-            print(f"[Topaz] ETA remaining: ~{remaining}s (adjusted timeout)")
+        eta = int(response.headers.get("X-ETA", 0)) if response.headers.get("X-ETA") else 0
+        eta_remaining = max(eta - int(time.time()), 0) if eta else 0
+        if eta_remaining > 0:
+            print(f"[Topaz] ETA remaining: ~{eta_remaining}s")
         
-        return task_id, eta
+        return process_id, eta_remaining
 
-    def _wait_for_completion(self, task_id, api_key, timeout):
+    def _wait_for_completion(self, process_id, api_key, timeout):
         headers = {"X-API-Key": api_key}
-        start_time = time.time()
-        poll_interval = 5  # Matches original
+        start = time.time()
+        poll_interval = 10  # Slower for async
         
-        status_url = f"{BASE_URL}/getStatus?task_id={task_id}"
+        status_url = f"{BASE_URL}/status/{process_id}"
         print(f"[Topaz] Status URL: {status_url}")
         
-        while time.time() - start_time < timeout:
+        while time.time() - start < timeout:
             resp = requests.get(status_url, headers=headers)
             print(f"[Topaz] Status code: {resp.status_code}")
             
             if resp.status_code == 404:
-                print("[Topaz] 404 on status - job may be pending or API mismatch. Retrying...")
+                print("[Topaz] 404 - job pending or not ready. Retrying...")
                 time.sleep(poll_interval)
                 continue
             
             resp.raise_for_status()
             status = resp.json()
-            print(f"[Topaz] Status: {status.get('status', 'unknown')}")
+            print(f"[Topaz] Status: {status.get('status')} | Progress: {status.get('progress', 'N/A')}%")
             
             if status.get("status") == "completed":
                 return True
@@ -111,61 +127,93 @@ class TopazUpscaler:
             
             time.sleep(poll_interval)
         
-        raise TimeoutError(f"Job {task_id} timed out after {timeout}s. Check Topaz dashboard for manual download.")
+        raise TimeoutError(f"Timeout after {timeout}s. Check dashboard with process_id: {process_id}")
 
-    def _download_result(self, task_id, api_key):
-        headers = {
-            "X-API-Key": api_key,
-            "accept": "image/jpeg"
-        }
-        download_url = f"{BASE_URL}/getDownloadOutput?task_id={task_id}"
-        print(f"[Topaz] Download URL: {download_url}")
+    def _download_result(self, process_id, api_key, output_format):
+        accept = FORMAT_ACCEPT.get(output_format, "image/jpeg")
+        headers = {"X-API-Key": api_key, "Accept": accept}
+        
+        download_url = f"{BASE_URL}/download/{process_id}"
+        print(f"[Topaz] Download URL: {download_url} (Format: {output_format})")
         
         resp = requests.get(download_url, headers=headers)
         print(f"[Topaz] Download code: {resp.status_code}")
         
         if resp.status_code == 404:
-            raise Exception(f"Download 404 - ensure job completed. Manual check: {download_url}")
+            raise Exception(f"Download 404 - job incomplete. ID: {process_id}")
         
         resp.raise_for_status()
         return resp.content
 
-    def upscale(self, image, api_key, output_width, scale_multiplier=1.0, crop_to_fill=False, timeout_seconds=180):
+    def process(self, image, api_key, mode, model,
+                scale_multiplier=1.0,
+                output_width=0, output_height=0, crop_to_fill=False,
+                output_format="jpeg", face_enhancement=True,
+                denoise_strength=0.5, sharpen_strength=0.5,
+                strength=0.5, fix_compression=0.0, timeout_seconds=300):
+
         if not api_key.strip():
-            raise ValueError("Topaz API key is required.")
+            raise ValueError("Topaz API key required.")
 
-        # === AUTO-SCALE ===
+        # Input size
         h, w = image.shape[1], image.shape[2]
-        if scale_multiplier != 1.0:
-            new_w = int(round(w * scale_multiplier))
-            output_width = min(max(new_w, 512), 16000)
-            print(f"[Topaz] Scale ×{scale_multiplier} → {w}×{h} → width={output_width}")
 
-        # === TEMP INPUT ===
+        # Auto-scale (enhance only)
+        use_auto = (mode == "enhance") and (scale_multiplier != 1.0)
+        if use_auto:
+            new_w = min(max(int(w * scale_multiplier), 1), 32000)
+            new_h = min(max(int(h * scale_multiplier), 1), 32000)
+            output_width, output_height = new_w, new_h
+            print(f"[Topaz] Auto-scale ×{scale_multiplier}: {w}×{h} → {new_w}×{new_h}")
+
+        # Params (all will be str in submit)
+        params = {
+            "model": model,
+            "output_format": output_format,
+            "face_enhancement": str(face_enhancement).lower(),
+            "denoise_strength": denoise_strength,
+            "sharpen_strength": sharpen_strength,
+            "strength": strength,
+            "fix_compression": fix_compression,
+        }
+        if mode == "enhance":
+            if output_width > 0:
+                params["output_width"] = output_width
+            if output_height > 0:
+                params["output_height"] = output_height
+            params["crop_to_fill"] = str(crop_to_fill).lower()
+
+        # Temp input
         img_np = (image[0].cpu().numpy() * 255).astype(np.uint8)
         pil_img = Image.fromarray(img_np)
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            pil_img.save(tmp.name, format="JPEG", quality=95)
+        suffix = ".jpg" if output_format == "jpeg" else f".{output_format}"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            kwargs = {"quality": 95} if output_format == "jpeg" else {}
+            pil_img.save(tmp.name, format=output_format.upper(), **kwargs)
             input_path = tmp.name
 
         try:
-            print(f"[Topaz] Submitting job | Width: {output_width}, Crop: {crop_to_fill}")
-            task_id, eta = self._submit_job(input_path, api_key, output_width, crop_to_fill)
+            print(f"[Topaz] Submitting {mode} | Model: {model} | Size: {output_width}×{output_height}")
+            process_id, eta_remaining = self._submit_job(input_path, api_key, mode, model, params)
+            
+            # Auto-extend timeout if ETA > current
+            if eta_remaining > timeout_seconds:
+                timeout_seconds = eta_remaining + 60  # Buffer
+                print(f"[Topaz] Extended timeout to {timeout_seconds}s based on ETA")
 
-            print(f"[Topaz] Waiting for completion...")
-            self._wait_for_completion(task_id, api_key, timeout_seconds)
+            print(f"[Topaz] Waiting...")
+            self._wait_for_completion(process_id, api_key, timeout_seconds)
 
             print(f"[Topaz] Downloading...")
-            result_bytes = self._download_result(task_id, api_key)
+            result_bytes = self._download_result(process_id, api_key, output_format)
 
-            # FIXED: Load from BytesIO (original bug)
             result_pil = Image.open(io.BytesIO(result_bytes))
             result_np = np.array(result_pil).astype(np.float32) / 255.0
             if len(result_np.shape) == 3 and result_np.shape[2] == 4:
-                result_np = result_np[:, :, :3]  # Drop alpha if PNG
-            result_tensor = result_np[np.newaxis, ...]  # Batch dim
+                result_np = result_np[:, :, :3]  # RGB
+            result_tensor = result_np[np.newaxis, ...]
 
-            print(f"[Topaz] Success! Output shape: {result_tensor.shape}")
+            print(f"[Topaz] Success! Shape: {result_tensor.shape}")
             return (result_tensor,)
 
         finally:
