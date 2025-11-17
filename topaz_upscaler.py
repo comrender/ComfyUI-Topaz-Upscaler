@@ -8,24 +8,38 @@ import io
 
 BASE_URL = "https://api.topazlabs.com/image/v1"
 
-# All modes
+# Modes (unchanged)
 TOPAZ_MODES = ["enhance", "sharpen", "denoise", "restore", "lighting"]
 
-# All models (from official docs)
-TOPAZ_MODELS = [
-    "Standard V2", "Low Resolution V2", "CGI", "High Fidelity V2", "Text Refine",
-    "Redefine", "Recovery V2", "Standard MAX", "Wonder",
-    "Standard", "Strong", "Lens Blur", "Lens Blur V2", "Motion Blur", "Natural", "Refocus",
-    "Super Focus V2",
-    "Normal", "Extreme",
-    "Dust-Scratch",
-    "Adjust", "White Balance"
-]
+# Updated models grouped by mode and type (from current docs)
+ENHANCE_GAN_MODELS = ["Standard V2", "Low Resolution V2", "CGI", "High Fidelity V2", "Text Refine"]
+ENHANCE_GEN_MODELS = ["Redefine", "Recovery V2", "Standard MAX", "Wonder"]
+SHARPEN_GAN_MODELS = ["Standard", "Strong", "Lens Blur", "Lens Blur V2", "Motion Blur", "Natural", "Refocus"]
+SHARPEN_GEN_MODELS = ["Super Focus V2"]
+DENOISE_GAN_MODELS = ["Normal", "Strong", "Extreme"]
+RESTORE_GEN_MODELS = ["Dust-Scratch"]
+LIGHTING_GAN_MODELS = ["Adjust", "White Balance"]
+
+# All unique models for the dropdown
+TOPAZ_MODELS = list(set(
+    ENHANCE_GAN_MODELS + ENHANCE_GEN_MODELS +
+    SHARPEN_GAN_MODELS + SHARPEN_GEN_MODELS +
+    DENOISE_GAN_MODELS +
+    RESTORE_GEN_MODELS +
+    LIGHTING_GAN_MODELS
+))
 
 FORMAT_ACCEPT = {
     "jpeg": "image/jpeg",
     "png": "image/png",
     "tiff": "image/tiff"
+}
+
+# Magic bytes for format validation
+FORMAT_MAGIC = {
+    "jpeg": b'\xff\xd8\xff',
+    "png": b'\x89PNG\r\n\x1a\n',
+    "tiff": [b'II*\x00', b'MM*\x00']
 }
 
 class TopazUpscaler:
@@ -65,13 +79,36 @@ class TopazUpscaler:
     CATEGORY = "image/topaz"
 
     def _get_submit_path(self, mode, model):
-        return {
-            "enhance": "/enhance/async",
-            "sharpen": "/sharpen/async",
-            "denoise": "/denoise/async",
-            "restore": "/restore-gen/async",
-            "lighting": "/lighting/async"
-        }.get(mode, "/enhance/async")
+        if mode == "enhance":
+            if model in ENHANCE_GEN_MODELS:
+                return "/enhance-gen/async"
+            elif model in ENHANCE_GAN_MODELS:
+                return "/enhance/async"
+            else:
+                raise ValueError(f"Invalid model '{model}' for mode 'enhance'")
+        elif mode == "sharpen":
+            if model in SHARPEN_GEN_MODELS:
+                return "/sharpen-gen/async"
+            elif model in SHARPEN_GAN_MODELS:
+                return "/sharpen/async"
+            else:
+                raise ValueError(f"Invalid model '{model}' for mode 'sharpen'")
+        elif mode == "denoise":
+            if model in DENOISE_GAN_MODELS:
+                return "/denoise/async"
+            else:
+                raise ValueError(f"Invalid model '{model}' for mode 'denoise'")
+        elif mode == "restore":
+            if model in RESTORE_GEN_MODELS:
+                return "/restore-gen/async"
+            else:
+                raise ValueError(f"Invalid model '{model}' for mode 'restore'")
+        elif mode == "lighting":
+            if model in LIGHTING_GAN_MODELS:
+                return "/lighting/async"
+            else:
+                raise ValueError(f"Invalid model '{model}' for mode 'lighting'")
+        raise ValueError(f"Invalid mode '{mode}'")
 
     def _submit_job(self, image_path, api_key, mode, model, params):
         path = self._get_submit_path(mode, model)
@@ -125,8 +162,7 @@ class TopazUpscaler:
         raise TimeoutError(f"Timed out after {timeout}s")
 
     def _download_result(self, process_id, api_key, output_format):
-        accept = FORMAT_ACCEPT.get(output_format, "image/jpeg")
-        headers = {"X-API-Key": api_key, "Accept": accept}
+        headers = {"X-API-Key": api_key, "Accept": "application/json"}
         url = f"{BASE_URL}/download/{process_id}"
         print(f"[Topaz] Download URL: {url}")
 
@@ -134,11 +170,35 @@ class TopazUpscaler:
             resp = requests.get(url, headers=headers, timeout=30)
             print(f"[Topaz] Download attempt {attempt+1} → {resp.status_code}")
 
-            if resp.status_code == 200 and resp.content.startswith(b'\xff\xd8\xff'):
-                print(f"[Topaz] Valid image received ({len(resp.content)/1024:.1f} KB)")
-                return resp.content
+            if resp.status_code == 409:
+                print(f"[Topaz] Not ready → retry in 3s...")
+                time.sleep(3)
+                continue
 
-            print(f"[Topaz] Not ready → retry in 3s...")
+            resp.raise_for_status()
+            data = resp.json()
+            download_url = data.get("download_url")
+            if not download_url:
+                raise ValueError("No download_url in response")
+
+            img_resp = requests.get(download_url, timeout=30)
+            img_resp.raise_for_status()
+            content = img_resp.content
+
+            # Validate based on format
+            valid = False
+            if output_format == "jpeg" and content.startswith(FORMAT_MAGIC["jpeg"]):
+                valid = True
+            elif output_format == "png" and content.startswith(FORMAT_MAGIC["png"]):
+                valid = True
+            elif output_format == "tiff" and content[:4] in FORMAT_MAGIC["tiff"]:
+                valid = True
+
+            if valid:
+                print(f"[Topaz] Valid image received ({len(content)/1024:.1f} KB)")
+                return content
+
+            print(f"[Topaz] Invalid image content → retry in 3s...")
             time.sleep(3)
 
         raise Exception("Failed to download valid image")
@@ -152,6 +212,7 @@ class TopazUpscaler:
         if not api_key.strip():
             raise ValueError("Topaz API key required")
 
+        # Auto-scale if enhance mode and multiplier !=1
         h, w = image.shape[1], image.shape[2]
         if mode == "enhance" and scale_multiplier != 1.0:
             new_w = max(1, min(32000, int(w * scale_multiplier)))
@@ -176,8 +237,15 @@ class TopazUpscaler:
         img_np = (image[0].cpu().numpy() * 255).astype(np.uint8)
         pil_img = Image.fromarray(img_np)
         suffix = ".jpg" if output_format == "jpeg" else f".{output_format}"
+        save_args = {}
+        if output_format == "jpeg":
+            save_args["quality"] = 95
+        elif output_format == "png":
+            save_args["compress_level"] = 4  # Balanced
+        elif output_format == "tiff":
+            save_args["compression"] = "tiff_deflate"
+
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            save_args = {"quality": 95} if output_format == "jpeg" else {}
             pil_img.save(tmp.name, format=output_format.upper(), **save_args)
             input_path = tmp.name
 
@@ -191,14 +259,11 @@ class TopazUpscaler:
             print(f"[Topaz] Downloading result...")
             result_bytes = self._download_result(process_id, api_key, output_format)
 
-            if not result_bytes.startswith(b'\xff\xd8\xff'):
-                raise ValueError("Downloaded file is not a valid image")
-
             result_pil = Image.open(io.BytesIO(result_bytes))
             result_np = np.array(result_pil).astype(np.float32) / 255.0
-            if result_np.shape[2] == 4:
+            if result_np.ndim == 3 and result_np.shape[2] == 4:
                 result_np = result_np[:, :, :3]
-            result_tensor = result_np[np.newaxis, ...]
+            result_tensor = np.expand_dims(result_np, axis=0)
 
             print(f"[Topaz] Success! Output: {result_tensor.shape} | {result_pil.format}")
             return (result_tensor,)
