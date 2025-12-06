@@ -1,6 +1,6 @@
 # ComfyUI Topaz Upscaler (API)
 
-A custom node that integrates the **Topaz Labs Image API**. This allows you to use Topaz's industry-leading AI models (Gigapixel, DeNoise, Sharpen) directly within your ComfyUI workflows.
+A custom node that integrates the **Topaz Labs Image API**. This allows you to use Topaz's industry-leading AI models directly within your ComfyUI workflows.
 
 <img width="425" height="460" alt="image" src="https://github.com/user-attachments/assets/efd30868-5fae-4854-8e56-f783ca77ad5c" />
 
